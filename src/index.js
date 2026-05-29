@@ -29,11 +29,33 @@ async function dbInit() {
       guncelleme INTEGER DEFAULT (unixepoch())
     )
   `);
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS islenmis_yorumlar (
+      yorum_id TEXT PRIMARY KEY,
+      tarih INTEGER DEFAULT (unixepoch())
+    )
+  `);
   try { await db.execute('ALTER TABLE kullanicilar ADD COLUMN son_mesaj INTEGER DEFAULT 0'); } catch(e) {}
 }
 dbInit().catch(e => console.error('DB init err:', e.message));
 
-const BIR_GUN_SANIYE = 24 * 60 * 60;
+// 7 günden eski işlenmiş yorumları temizle
+async function eskiYorumlariTemizle() {
+  const sinir = Math.floor(Date.now() / 1000) - 7 * 24 * 3600;
+  await db.execute({ sql: 'DELETE FROM islenmis_yorumlar WHERE tarih < ?', args: [sinir] });
+}
+setInterval(eskiYorumlariTemizle, 24 * 60 * 60 * 1000);
+
+async function yorumIslendi(yorumId) {
+  try {
+    await db.execute({ sql: 'INSERT INTO islenmis_yorumlar (yorum_id) VALUES (?)', args: [yorumId] });
+    return true;
+  } catch(e) {
+    return false;
+  }
+}
+
+const BIR_GUN_SANIYE = 45 * 60; // 45 dakika
 
 async function dbKullaniciAl(id) {
   const r = await db.execute({ sql: 'SELECT * FROM kullanicilar WHERE id = ?', args: [id] });
@@ -147,20 +169,91 @@ function bekle(ms) {
 }
 
 // ─── API ÇAĞRILARI ─────────────────────────────────────────────────────────────
+// ─── ŞEHİR TESPİTİ & RİSK ────────────────────────────────────────────────────
+const SEHIR_MAP = {
+  'eskişehir': 'eskisehir', 'istanbul': 'istanbul', 'ankara': 'ankara',
+  'izmir': 'izmir', 'şanlıurfa': 'sanliurfa', 'konya': 'konya',
+  'bursa': 'bursa', 'antalya': 'antalya', 'adana': 'adana',
+  'gaziantep': 'gaziantep', 'kayseri': 'kayseri', 'mersin': 'mersin',
+  'diyarbakır': 'diyarbakir', 'samsun': 'samsun', 'trabzon': 'trabzon',
+};
+
+function sehirTespit(adres) {
+  const k = adres.toLowerCase();
+  for (const [tr, slug] of Object.entries(SEHIR_MAP)) {
+    if (k.includes(tr)) return { isim: tr, slug };
+  }
+  return { isim: '', slug: '' };
+}
+
+function adresParcala(adres) {
+  const binaRegex = /([A-ZÇĞİÖŞÜa-zçğışöşü\s]+(APT|APARTMANI|APARTMAN|PLAZA|İŞ MERKEZİ|IS MERKEZI|İŞHANI|ISHANI|TOWER|REZİDANS|REZIDANS|BLOK)[A-ZÇĞİÖŞÜa-zçğışöşü\s\.]*)/i;
+  const binaMatch = adres.match(binaRegex);
+  const bina = binaMatch ? binaMatch[0].trim() : '';
+  const sehir = sehirTespit(adres);
+  return { bina, sehir };
+}
+
+function riskHesapla(siparis) {
+  const adres = (siparis.adres || '').toLowerCase();
+  const riskliKelimeler = ['plaza', 'iş merkezi', 'is merkezi', 'işhanı', 'ishani', 'tower', 'rezidans', 'ofis', 'büro', 'buro'];
+  const bulunan = riskliKelimeler.filter(k => adres.includes(k));
+
+  if (bulunan.length > 0) {
+    const etiket = bulunan.map(k => k.charAt(0).toUpperCase() + k.slice(1)).join(', ');
+    return { riskEmoji: '🔴', riskTR: 'YÜKSEK RİSK', riskAciklama: etiket + ' tespit edildi' };
+  }
+
+  const katRegex = /k[:\.]?\s*[3-9]|kat\s*[3-9]/i;
+  if (katRegex.test(siparis.adres || '')) {
+    return { riskEmoji: '🟡', riskTR: 'ORTA RİSK', riskAciklama: 'Yüksek kat — ofis olabilir' };
+  }
+
+  return { riskEmoji: '🟢', riskTR: 'NORMAL', riskAciklama: 'Standart konut adresi' };
+}
+
 async function telegramGonder(siparis) {
   try {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+
     const urun = kodaIsimCevir(siparis.urun.toUpperCase());
+    const telefon = (siparis.telefon || '').replace(/\s/g, '');
+    const telefonUyari = telefon.replace(/\D/g, '').length < 10 ? ' ⚠️EKSİK' : '';
+    const { bina, sehir } = adresParcala(siparis.adres || '');
+    const { riskEmoji, riskTR, riskAciklama } = riskHesapla(siparis);
+
+    const baroLink = 'https://www.barobirlik.org.tr/AvukatArama/?q=' + encodeURIComponent(siparis.ad_soyad);
+    const googleTel = 'https://www.google.com/search?q=' + encodeURIComponent('"' + telefon + '"');
+    const googleIsimSadece = 'https://www.google.com/search?q=' + encodeURIComponent('"' + siparis.ad_soyad + '"');
+    const googleIsimSehir = 'https://www.google.com/search?q=' + encodeURIComponent('"' + siparis.ad_soyad + '" ' + sehir.isim + ' avukat hukuk');
+    const googleAdres = 'https://www.google.com/search?q=' + encodeURIComponent('"' + (bina || siparis.adres) + '" avukat hukuk');
+
     const msg =
-      'YENİ SİPARİŞ!\n\n' +
-      'AD SOYAD: ' + siparis.ad_soyad.toUpperCase() + '\n' +
-      'TELEFON: ' + siparis.telefon + '\n' +
+      '📦 YENİ SİPARİŞ!\n\n' +
+      'AD: ' + siparis.ad_soyad.toUpperCase() + '\n' +
+      'TEL: ' + siparis.telefon + telefonUyari + '\n' +
       'ADRES: ' + siparis.adres.toUpperCase() + '\n' +
       'ÜRÜN: ' + urun + '\n' +
-      'TOPLAM: ' + siparis.toplam + ' TL';
-    await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      'TOPLAM: ' + siparis.toplam + ' TL\n\n' +
+      '━━━━━━━━━━━━━━━━━━━━━\n' +
+      riskEmoji + ' ' + riskTR + ' — ' + riskAciklama + '\n' +
+      '━━━━━━━━━━━━━━━━━━━━━\n' +
+      '🔗 SORGULA\n' +
+      '━━━━━━━━━━━━━━━━━━━━━\n' +
+      '📱 ' + googleTel + '\n' +
+      '──────────────────\n' +
+      '👤 ' + googleIsimSadece + '\n' +
+      '──────────────────\n' +
+      '👤 ' + googleIsimSehir + '\n' +
+      '──────────────────\n' +
+      '⚖️ ' + baroLink + '\n' +
+      '──────────────────\n' +
+      '🏢 ' + googleAdres;
+
+    await axios.post('https://api.telegram.org/bot' + TELEGRAM_BOT_TOKEN + '/sendMessage', {
       chat_id: TELEGRAM_CHAT_ID,
       text: msg,
+      disable_web_page_preview: true,
     });
   } catch (e) {
     console.error('Telegram err:', e.message);
@@ -170,7 +263,7 @@ async function telegramGonder(siparis) {
 async function igMesaj(id, metin) {
   try {
     await axios.post(
-      'https://graph.instagram.com/v21.0/me/messages',
+      'https://graph.instagram.com/v25.0/me/messages',
       { recipient: { id }, message: { text: metin } },
       { headers: { Authorization: `Bearer ${IG_ACCESS_TOKEN}`, 'Content-Type': 'application/json' } }
     );
@@ -180,7 +273,7 @@ async function igMesaj(id, metin) {
 async function igGorsel(id, url) {
   try {
     await axios.post(
-      'https://graph.instagram.com/v21.0/me/messages',
+      'https://graph.instagram.com/v25.0/me/messages',
       { recipient: { id }, message: { attachment: { type: 'image', payload: { url, is_reusable: true } } } },
       { headers: { Authorization: `Bearer ${IG_ACCESS_TOKEN}`, 'Content-Type': 'application/json' } }
     );
@@ -365,7 +458,7 @@ Kodları asla gösterme. Daima tam adı büyük harfle yaz:
 - 0012 → GS RETRO SARI FORMASI
 - 0013 → GS RETRO KIRMIZI FORMASI
 - 0014 → GS YEŞİL TASARIM FORMASI
-Tüm ürünler forma + şort takım halinde.
+Yetişkin ürünlerimizde maalesef şort bulunmamaktadır, sadece forma olarak gönderim yapılıyor. Şort sadece çocuk formalarında mevcuttur.
 
 === STOK ===
 Belirli model sorulursa: "Efendim güncel modellerimiz bu şekildedir, bunların haricinde ekstra bir modelimiz yoktur."
@@ -417,7 +510,7 @@ Müşteri ürün adını söylerse kodu ayrıca sorma. Müşteri kod yazarsa dir
 - Çekme: çekmez.
 - Logo: nakış, sökülmez.
 - İndirim: kampanya fiyatı bu.
-- 12+ yaş çocuk: mevcut. 12 yaş altı: yok. Çocuk baskı: sadece sorulursa evet.
+- 12+ yaş çocuk: mevcut, forma + şort takım halinde geliyor. 12 yaş altı: yok. Çocuk baskı: sadece sorulursa evet. Çocuk çorap: maalesef yok.
 
 === SİPARİŞ AKIŞI (sırayla takip et) ===
 ADIM 1: Görseller otomatik gönderilir.
@@ -460,6 +553,60 @@ Ardından şu JSON bloğunu çıkar (müşteriye gösterme):
 ###SIPARIS_BITIS###`;
 
 // ─── WEBHOOK ──────────────────────────────────────────────────────────────────
+
+const YORUM_VARYASYONLAR = [
+  'Merhaba efendim, sizinle daha iyi ilgilenebilmek için bize özelden yazmanızı rica ediyoruz, tüm sorularınızı memnuniyetle yanıtlarız 🙏🏻',
+  'Merhaba efendim, fiyat ve modeller hakkında daha iyi bilgi verebilmemiz için bize özelden yazmanızı rica ederiz 🙏🏻',
+  'Merhaba efendim, detaylı bilgi almak için bize özelden yazabilirsiniz, size yardımcı olmaktan mutluluk duyarız 🙏🏻',
+  'Merhaba efendim, sizinle birebir ilgilenebilmemiz için bize özelden yazmanızı bekliyoruz 🙏🏻',
+  'Merhaba efendim, tüm sorularınız için bize özelden yazabilirsiniz, en kısa sürede yardımcı oluruz 🙏🏻',
+  'Merhaba efendim, size özel bilgi verebilmemiz için bize özelden yazmanızı rica ederiz 🙏🏻',
+  'Merhaba efendim, daha sağlıklı bilgi verebilmek adına bize özelden yazmanızı bekliyoruz 🙏🏻',
+  'Merhaba efendim, sorularınızı bize özelden iletirseniz sizinle daha yakından ilgilenebiliriz 🙏🏻',
+  'Merhaba efendim, detaylar için bize özelden yazmanız yeterli, hemen yardımcı oluruz 🙏🏻',
+  'Merhaba efendim, bilgi almak için bize özelden yazabilirsiniz, memnuniyetle karşılık veririz 🙏🏻',
+  'Merhaba efendim, size daha iyi yardımcı olabilmemiz için bize özelden yazmanızı öneririz 🙏🏻',
+  'Merhaba efendim, merak ettikleriniz için bize özelden yazarsanız her şeyi detaylıca aktarırız 🙏🏻',
+  'Merhaba efendim, fiyat ve ürünler hakkında bize özelden yazmanız yeterli, anında bilgi verelim 🙏🏻',
+  'Merhaba efendim, sizinle özelden görüşmek isteriz, bize yazmanız yeterli 🙏🏻',
+  'Merhaba efendim, daha iyi hizmet verebilmek için bize özelden yazmanızı rica ediyoruz 🙏🏻',
+  'Merhaba efendim, sorularınıza en doğru yanıtı verebilmek için bize özelden yazmanızı bekliyoruz 🙏🏻',
+  'Merhaba efendim, ürünlerimiz hakkında merak ettikleriniz için bize özelden yazabilirsiniz 🙏🏻',
+  'Merhaba efendim, size özel ilgi gösterebilmemiz için bize özelden yazmanızı rica ederiz 🙏🏻',
+  'Merhaba efendim, tüm detayları paylaşabilmemiz için bize özelden yazmanız yeterli 🙏🏻',
+  'Merhaba efendim, en hızlı şekilde yardımcı olabilmemiz için bize özelden yazmanızı bekliyoruz 🙏🏻',
+];
+
+function rastgeleVaryasyon() {
+  return YORUM_VARYASYONLAR[Math.floor(Math.random() * YORUM_VARYASYONLAR.length)];
+}
+
+// ─── BOT'UN KENDİ IG ID'Sİ — başlangıçta çek ────────────────────────────────
+let BOT_IG_ID = '';
+async function botIdAl() {
+  try {
+    const r = await axios.get('https://graph.instagram.com/v25.0/me?fields=id', {
+      headers: { Authorization: 'Bearer ' + IG_ACCESS_TOKEN }
+    });
+    BOT_IG_ID = r.data.id;
+    console.log('Bot IG ID:', BOT_IG_ID);
+  } catch(e) {
+    console.error('Bot ID alinamadi:', e.message);
+  }
+}
+botIdAl();
+
+async function yorumuCevapla(yorumId, metin) {
+  try {
+    await axios.post(
+      'https://graph.instagram.com/v25.0/' + yorumId + '/replies',
+      { message: metin },
+      { headers: { Authorization: 'Bearer ' + IG_ACCESS_TOKEN, 'Content-Type': 'application/json' } }
+    );
+    console.log('Yorum cevaplandi:', yorumId);
+  } catch (e) { console.error('Yorum cevapla err:', e.message); }
+}
+
 app.get('/webhook', (req, res) => {
   if (
     req.query['hub.mode'] === 'subscribe' &&
@@ -472,13 +619,51 @@ app.get('/webhook', (req, res) => {
 });
 
 app.post('/webhook', async (req, res) => {
-  res.status(200).send('OK'); // IG 200 bekliyor, hemen yanıtla
+  res.status(200).send('OK');
 
   try {
     const body = req.body;
-    if (body.object !== 'instagram') return;
+
+    console.log('WEBHOOK GELDI | object:', body.object, '| entry sayisi:', (body.entry || []).length);
+
+    if (body.object !== 'instagram' && body.object !== 'page') return;
 
     for (const entry of body.entry) {
+
+      // ── YORUM OTOMASYONU ──
+      for (const change of (entry.changes || [])) {
+        console.log('CHANGE FIELD:', change.field, '| value:', JSON.stringify(change.value).slice(0, 100));
+
+        if (change.field !== 'comments') continue;
+        const yorum = change.value;
+        if (!yorum || !yorum.id) continue;
+
+        // Sadece ana yorumlara cevap ver, reply'ları atla (döngü önleme)
+        if (yorum.parent_id) {
+          console.log('Reply yorumu, atlandi:', yorum.id);
+          continue;
+        }
+
+        // Botun kendi yorumlarını atla
+        const yorumYapanId = yorum.from?.id || yorum.from_id || '';
+        if (BOT_IG_ID && yorumYapanId === BOT_IG_ID) {
+          console.log('Bot kendi yorumu, atlandi');
+          continue;
+        }
+
+        // Daha önce işlendiyse atla — Turso DB'de kontrol et
+        const yeni = await yorumIslendi(yorum.id);
+        if (!yeni) {
+          console.log('Tekrar eden yorum, atlandi:', yorum.id);
+          continue;
+        }
+
+        console.log('YORUM ALINDI:', yorum.id, '| metin:', yorum.text);
+
+        await bekle(1000);
+        await yorumuCevapla(yorum.id, rastgeleVaryasyon());
+      }
+
       for (const event of (entry.messaging || [])) {
         const sid = event.sender?.id;
         const txt = event.message?.text;
