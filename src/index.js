@@ -43,6 +43,8 @@ async function dbInit() {
     )
   `);
   try { await db.execute('ALTER TABLE kullanicilar ADD COLUMN son_mesaj INTEGER DEFAULT 0'); } catch(e) {}
+  try { await db.execute('ALTER TABLE kullanicilar ADD COLUMN siparis_verildi INTEGER DEFAULT 0'); } catch(e) {}
+  try { await db.execute('ALTER TABLE kullanicilar ADD COLUMN siparis_tarihi INTEGER DEFAULT 0'); } catch(e) {}
 }
 dbInit().catch(e => console.error('DB init err:', e.message));
 
@@ -83,25 +85,44 @@ async function takipMesajiGonderilsinMi(id) {
   }
 }
 
-const BIR_GUN_SANIYE = 45 * 60; // 45 dakika
+const BIR_GUN_SANIYE = 24 * 60 * 60; // 24 saat
 
 async function dbKullaniciAl(id) {
   const r = await db.execute({ sql: 'SELECT * FROM kullanicilar WHERE id = ?', args: [id] });
   const simdi = Math.floor(Date.now() / 1000);
   if (r.rows.length === 0) {
     await db.execute({ sql: 'INSERT INTO kullanicilar (id, son_mesaj) VALUES (?, ?)', args: [id, simdi] });
-    return { gorselGitti: false, kartUyariGitti: false, konusmalar: [] };
+    return { gorselGitti: false, kartUyariGitti: false, konusmalar: [], siparisVerildi: false, siparisTarihi: 0 };
   }
   const row = r.rows[0];
   const sonMesaj = Number(row.son_mesaj) || 0;
-  // 1 gunden fazla sessizlik → sifirla
+  const siparisVerildi = !!row.siparis_verildi;
+  const siparisTarihi = Number(row.siparis_tarihi) || 0;
+  const BES_GUN = 5 * 24 * 60 * 60;
+
+  if (siparisVerildi) {
+    if ((simdi - siparisTarihi) > BES_GUN) {
+      await db.execute({ sql: 'UPDATE kullanicilar SET gorsel_gitti=0, kart_uyari_gitti=0, konusmalar=?, siparis_verildi=0, siparis_tarihi=0 WHERE id=?', args: ['[]', id] });
+      return { gorselGitti: false, kartUyariGitti: false, konusmalar: [], siparisVerildi: false, siparisTarihi: 0 };
+    }
+    return {
+      gorselGitti:    true,
+      kartUyariGitti: !!row.kart_uyari_gitti,
+      konusmalar:     JSON.parse(row.konusmalar || '[]'),
+      siparisVerildi: true,
+      siparisTarihi,
+    };
+  }
+
   if ((simdi - sonMesaj) > BIR_GUN_SANIYE && row.gorsel_gitti) {
-    return { gorselGitti: false, kartUyariGitti: false, konusmalar: [] };
+    return { gorselGitti: false, kartUyariGitti: false, konusmalar: [], siparisVerildi: false, siparisTarihi: 0 };
   }
   return {
     gorselGitti:    !!row.gorsel_gitti,
     kartUyariGitti: !!row.kart_uyari_gitti,
     konusmalar:     JSON.parse(row.konusmalar || '[]'),
+    siparisVerildi: false,
+    siparisTarihi:  0,
   };
 }
 
@@ -110,13 +131,16 @@ async function dbKaydet(id, data) {
   await db.execute({
     sql: `UPDATE kullanicilar
           SET gorsel_gitti = ?, kart_uyari_gitti = ?, konusmalar = ?,
-              son_mesaj = ?, guncelleme = unixepoch()
+              son_mesaj = ?, guncelleme = unixepoch(),
+              siparis_verildi = ?, siparis_tarihi = ?
           WHERE id = ?`,
     args: [
       data.gorselGitti ? 1 : 0,
       data.kartUyariGitti ? 1 : 0,
       JSON.stringify(data.konusmalar),
       simdi,
+      data.siparisVerildi ? 1 : 0,
+      data.siparisTarihi || 0,
       id,
     ],
   });
@@ -125,7 +149,7 @@ async function dbKaydet(id, data) {
 // 30 günden eski kayıtları temizle
 async function eskiKayitlariTemizle() {
   const sinir = Math.floor(Date.now() / 1000) - 30 * 24 * 3600;
-  await db.execute({ sql: 'DELETE FROM kullanicilar WHERE guncelleme < ?', args: [sinir] });
+  await db.execute({ sql: 'DELETE FROM kullanicilar WHERE guncelleme < ? AND siparis_verildi = 0', args: [sinir] });
 }
 setInterval(eskiKayitlariTemizle, 24 * 60 * 60 * 1000);
 
@@ -270,7 +294,10 @@ async function telegramGonder(siparis) {
 
     const urun = kodaIsimCevir(siparis.urun.toUpperCase());
     const telefon = (siparis.telefon || '').replace(/\s/g, '');
-    const telefonUyari = telefon.replace(/\D/g, '').length < 10 ? ' ⚠️EKSİK' : '';
+    let telefonRakam = telefon.replace(/\D/g, '');
+    if (telefonRakam.startsWith('90')) telefonRakam = telefonRakam.slice(2);
+    if (telefonRakam.startsWith('0')) telefonRakam = telefonRakam.slice(1);
+    const telefonUyari = telefonRakam.length !== 10 ? ' ⚠️EKSİK' : '';
     const { bina, sehir } = adresParcala(siparis.adres || '');
     const { riskEmoji, riskTR, riskAciklama } = riskHesapla(siparis);
 
@@ -286,7 +313,8 @@ async function telegramGonder(siparis) {
       'TEL: ' + siparis.telefon + telefonUyari + '\n' +
       'ADRES: ' + siparis.adres.toUpperCase() + '\n' +
       'ÜRÜN: ' + urun + '\n' +
-      'TOPLAM: ' + siparis.toplam + ' TL\n\n' +
+      'TOPLAM: ' + siparis.toplam + ' TL\n' +
+      'TOPLAM ADET: ' + (siparis.adet || '-') + '\n\n' +
       '━━━━━━━━━━━━━━━━━━━━━\n' +
       riskEmoji + ' ' + riskTR + ' — ' + riskAciklama + '\n' +
       '━━━━━━━━━━━━━━━━━━━━━\n' +
@@ -387,7 +415,6 @@ async function isle(id) {
 
   // DB'den kullanıcı verisi
   const veri = await dbKullaniciAl(id);
-  const ilkMi = veri.konusmalar.length === 0;
 
   // ── Vitrin: sadece ilk mesajda, sadece 1 kez ──
   if (!veri.gorselGitti) {
@@ -410,25 +437,45 @@ async function isle(id) {
     // Soru varsa Claude da cevap versin — devam et
   }
 
-  // ── Kart uyarısı: sadece 1 kez ──
+  // ── Kart sorusu kontrolü ──
   if (kartVar(birlesik) && !veri.kartUyariGitti) {
-    veri.kartUyariGitti = true;
-    veri.konusmalar.push({ role: 'user', content: birlesik });
-    veri.konusmalar.push({ role: 'assistant', content: KART_UYARI });
-    dbKaydet(id, veri);
-
-    await igMesaj(id, KART_UYARI);
-    durum.mesgulMu = false;
-    if (durum.bekleyenler.length > 0) await isle(id);
-    return;
+    const siparisAsamasinda = veri.konusmalar.some(m =>
+      m.role === 'assistant' && (
+        m.content.includes('Onaylıyor musunuz') ||
+        m.content.includes('TOPLAM:') ||
+        m.content.includes('nakit mi') ||
+        m.content.includes('Nakit mi') ||
+        m.content.includes('kart mı') ||
+        m.content.includes('Kart mı')
+      )
+    );
+    if (!siparisAsamasinda) {
+      veri.konusmalar.push({ role: 'user', content: birlesik });
+      const kartCevap = 'Evet tabiki yapabilirsiniz efendim, kapıda kartla ödeme seçeneğimiz mevcut.';
+      veri.konusmalar.push({ role: 'assistant', content: kartCevap });
+      await dbKaydet(id, veri);
+      await igMesaj(id, kartCevap);
+      durum.mesgulMu = false;
+      if (durum.bekleyenler.length > 0) await isle(id);
+      return;
+    } else {
+      veri.kartUyariGitti = true;
+      veri.konusmalar.push({ role: 'user', content: birlesik });
+      veri.konusmalar.push({ role: 'assistant', content: KART_UYARI });
+      await dbKaydet(id, veri);
+      await igMesaj(id, KART_UYARI);
+      durum.mesgulMu = false;
+      if (durum.bekleyenler.length > 0) await isle(id);
+      return;
+    }
   }
 
   // ── Claude'a gönder ──
   veri.konusmalar.push({ role: 'user', content: birlesik });
 
   // Maliyet optimizasyonu: son 10 mesaj (20 yerine)
-  if (veri.konusmalar.length > 10) {
-    veri.konusmalar = veri.konusmalar.slice(-10);
+  if (veri.konusmalar.length > 40) {
+    veri.konusmalar = veri.konusmalar.slice(-40);
   }
 
   const yanit = await claude(veri.konusmalar);
@@ -439,11 +486,19 @@ async function isle(id) {
     .trim();
 
   veri.konusmalar.push({ role: 'assistant', content: temiz });
-  dbKaydet(id, veri);
+  await dbKaydet(id, veri);
 
-  // Sipariş varsa Telegram'a gönder
   const siparis = siparisiParsEt(yanit);
-  if (siparis && siparis.ad_soyad) await telegramGonder(siparis);
+  if (siparis && siparis.ad_soyad) {
+    await telegramGonder(siparis);
+    veri.siparisVerildi = true;
+    veri.siparisTarihi = Math.floor(Date.now() / 1000);
+    await dbKaydet(id, veri);
+    if (durum.takipTimer) {
+      clearTimeout(durum.takipTimer);
+      durum.takipTimer = null;
+    }
+  }
 
   // Yanıtı gönder
   if (yanit.includes('###VITRIN_GOSTER###')) {
@@ -504,7 +559,7 @@ Asla "görselleri iletiyorum" veya "gönderiyorum" deme — görselleri tekrar g
 
 === PAYLAŞILAN GÖNDERI ===
 Müşteri Instagram gönderi/reels paylaşırsa:
-"Efendim, daha sağlıklı yardımcı olabilmem için ekran fotoğrafı atar mısınız?"
+"Efendim görselin üzerindeki kodu bize iletir misiniz? Örneğin 0011 gibi."
 
 === ÜRÜNLER ===
 Kodları asla gösterme. Daima tam adı büyük harfle yaz:
@@ -521,13 +576,12 @@ Belirli model sorulursa: "Efendim güncel modellerimiz bu şekildedir, bunların
 - 1 adet: 630 TL
 - 2 adet: 1.250 TL (kampanya otomatik devreye girer, aşağıya bak)
 - 3 adet: 1.250 TL (kampanya: 2 al 1 hediye)
-- 4 adet: 1.750 TL
+Müşteri 4 adet ve üzeri sorarsa: "Efendim şu an için en fazla 3 adet kampanyamız bulunuyor."
+ASLA kendi başına fiyat hesaplama. Yukarıdaki fiyatların dışına çıkma.
 
 KAMPANYA KURALI (ÇOK ÖNEMLİ):
 Müşteri 2 forma seçerse: "Efendim kampanyamız var, 1 forma da bizden size hediye. Gönderdiğimiz görseller üzerinden istediğiniz 1 formanın kodunu iletirseniz kampanyamızdan yararlanmış olursunuz."
 Müşteri 3 forma seçerse: Kampanya otomatik uygulanır, fiyat 1.250 TL'dir. Ayrıca sormadan uygula.
-Müşteri 4 forma seçerse: 1.750 TL.
-ASLA kendi başına fiyat hesaplama. Yukarıdaki fiyatların dışına çıkma.
 
 FİYAT SORUSU GELİNCE:
 Müşteri fiyat, kampanya, kaç para gibi sorular sorarsa önce ###VITRIN_GOSTER### yaz, sonra kısa açıklama yap.
@@ -565,6 +619,10 @@ ASLA "geniş kalıplıdır" deme eğer müşteri dar kalıp istiyorsa.
 Müşteri 3XL isterse:
 "Efendim 3XL bedenimiz bulunmuyor, ancak kalıplarımız geniş olduğu için 2XL sizin için tam oturacaktır. Dilerseniz 2XL üzerinden yardımcı olayım."
 
+Müşteri 4XL, 5XL, 6XL, 7XL, 8XL veya 9XL isterse:
+"Maalesef sizlere uygun bir bedenimiz bulunmuyor."
+Başka beden önerme, alternatif sunma.
+
 Müşteri kalıp belirtmezse sadece kilo sor, kalıp hakkında yorum yapma.
 
 === TESLİMAT ===
@@ -574,6 +632,30 @@ Sipariş sonrası direkt: "2-3 iş günü içerisinde sizde olur efendim."
 === İADE ===
 Bu bilgiyi proaktif olarak söyleme. Sadece müşteri "yanlış gelirse", "dar olursa", "beden tutmazsa" gibi endişe belirtirse söyle:
 "Ürün sizlere ulaştıktan sonra 2 gün içerisinde bizlere ulaşırsanız sorununuzu çözüme kavuşturabiliriz efendim."
+
+=== TELEFON DOĞRULAMA ===
+Müşteri telefon numarası iletirse şu kurallara göre kontrol et:
+- Başında 0 varsa (05XX XXX XX XX): 0 hariç 10 rakam olmalı
+- Başında +90 veya 90 varsa: +90/90 hariç 10 rakam olmalı
+- Direkt 10 rakam yazılmışsa (5XX XXX XX XX): geçerlidir
+Yani tüm varyasyonlarda temizlenmiş hali 10 rakam olmalı. Eğer açıkça eksik görünüyorsa: "Telefon numaranız eksik görünüyor, tekrar iletir misiniz?"
+Emin değilsen sor, doğru numarayı yanlış sayma.
+
+=== ADRES DOĞRULAMA ===
+Müşteri adres iletirse il, ilçe ve mahalle bilgisinin hepsinin olup olmadığını kontrol et.
+Eksikse sadece eksik olanı sor: "Adresinizde [il/ilçe/mahalle] bilgisi eksik, tamamlayabilir misiniz?"
+Üçü de tamamlanmadan sipariş özetine geçme.
+
+=== SOHBET GEÇMİŞİ ===
+Her cevap vermeden önce tüm sohbet geçmişini göz önünde bulundur. Müşteri daha önce il, ilçe veya başka bir bilgi vermişse tekrar sorma. Belirsiz bir durum varsa kısa ve net bir soru sor, atlama.
+Müşteri "dün söylemiştim", "daha önce yazdım", "geçen konuştuk" gibi bir şey derse:
+"Sistemsel bir sorun yaşıyoruz, önceki sohbetimizi görüntülemeye çalışıyoruz fakat Instagram ile alakalı bir sorun var. Dilerseniz yeniden yardımcı olabilirim sizlere." de.
+
+=== ÇOCUK FORMASI SİPARİŞİ ===
+Müşteri çocuk forması isterse kilo değil yaş sor: "Çocuğunuz kaç yaşında efendim?"
+Yaşa göre sipariş al, ürün adının yanına yaşı yaz. Örnek: GS LION TASARIM FORMASI 12 YAŞ
+12 yaş altı için: "Maalesef 12 yaş altı için ürünümüz bulunmuyor efendim."
+Sipariş özetinde beden yerine yaş yaz: [ÜRÜN ADI] [YAŞ]
 
 === KOD KURALI ===
 Müşteri ürün adını söylerse kodu ayrıca sorma. Müşteri kod yazarsa direkt kabul et.
@@ -601,6 +683,7 @@ Müşteri ürün adını söylerse kodu ayrıca sorma. Müşteri kod yazarsa dir
 ADIM 1: Görseller otomatik gönderilir.
 ADIM 2: Müşteri ürün kodu veya ürün adı iletir. Her ikisi de geçerlidir, kodu ayrıca sorma.
 ADIM 3: Ürünü BÜYÜK HARFLE tam adına çevir. Beden bilgisi yoksa sadece kilo sor. Beden zaten belli ise bir daha sorma.
+ADIM 3B: Adet konusunda dikkat et. Müşteri kaç ürün kodu veya isim ilettiyse o kadar adet almak istiyor demektir, ayrıca sorma. Sadece hiçbir şekilde anlaşılamıyorsa sor.
 ADIM 4: Beden belli olunca şu formu gönder:
 "Siparişinizi Oluşturmak İçin
 
@@ -620,7 +703,7 @@ NAKİT onay özeti (TAMAMI BÜYÜK HARF):
 
 [TELEFON]
 
-[ÜRÜN ADI] [BEDEN]
+[ÜRÜN ADI] [BEDEN] - [ADET] ADET
 
 TOPLAM: X TL - KAPIDA NAKİT
 
@@ -634,7 +717,7 @@ KART onay özeti (onaydan sonra, TAMAMI BÜYÜK HARF): aynı format + "+50 TL PO
 
 Ardından şu JSON bloğunu çıkar (müşteriye gösterme):
 ###SIPARIS_BASLA###
-{"ad_soyad":"","telefon":"","adres":"","urun":"","toplam":""}
+{"ad_soyad":"","telefon":"","adres":"","urun":"","adet":"","toplam":""}
 ###SIPARIS_BITIS###`;
 
 // ─── WEBHOOK ──────────────────────────────────────────────────────────────────
@@ -780,12 +863,14 @@ app.post('/webhook', async (req, res) => {
           durum.timer = null;
           await isle(sid);
 
-          // 45 dk takip timer'ı başlat
+          // 45 dk takip timer'ı başlat (sipariş veren müşteriye gönderme)
           durum.takipTimer = setTimeout(async () => {
             durum.takipTimer = null;
+            const veriKontrol = await dbKullaniciAl(sid);
+            if (veriKontrol.siparisVerildi) return;
             const gonder = await takipMesajiGonderilsinMi(sid);
             if (gonder) {
-              await igMesaj(sid, 'Yardımcı olabileceğim bir konu olursa sizin için buradayım efendim, aklınıza takılan bir soru var mı? Yoksa sadece fiyat bilgisi için mi ulaşmıştınız? 🙏🏻');
+              await igMesaj(sid, 'Aklınıza takılan bir soru var mı, yardımcı olabilir miyim?');
             }
           }, 45 * 60 * 1000);
         }, 3000);
