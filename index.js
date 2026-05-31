@@ -417,8 +417,10 @@ async function isle(id) {
   const veri = await dbKullaniciAl(id);
 
   // ── Vitrin: sadece ilk mesajda, sadece 1 kez ──
+  let vitrinBuTurGitti = false;
   if (!veri.gorselGitti) {
     veri.gorselGitti = true;
+    vitrinBuTurGitti = true;
     await igMesaj(id, VITRIN_METNI);
     for (const url of TUM_GORSELLER) {
       await igGorsel(id, url);
@@ -500,8 +502,8 @@ async function isle(id) {
     }
   }
 
-  // Yanıtı gönder
-  if (yanit.includes('###VITRIN_GOSTER###')) {
+  // Yanıtı gönder — vitrin bu turda zaten gittiyse tekrar gönderme
+  if (yanit.includes('###VITRIN_GOSTER###') && !vitrinBuTurGitti) {
     await igMesaj(id, VITRIN_METNI);
   } else if (temiz) {
     await igMesaj(id, temiz);
